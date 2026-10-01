@@ -1,0 +1,15 @@
+# secrets & local state - never commit
+.env
+*.env
+!.env.example
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+*.sqlite3
+*.dump
+*.sql.data
+*.sql.schema
+node_modules/
+dist/
+.DS_Store

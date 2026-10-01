@@ -1,0 +1,106 @@
+services:
+  db:
+    image: postgres:latest
+    restart: always
+    shm_size: 128mb
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:-ollama_cpp_mcp}
+      POSTGRES_DB: ollama_memoryDB
+    volumes:
+      - ./db/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    entrypoint:
+      - bash
+      - -c
+      - |
+        apt-get update &&
+        apt-get install -y \
+          postgresql-plpython3-$$PG_MAJOR \
+          postgresql-$$PG_MAJOR-pgvector \
+          postgresql-$$PG_MAJOR-cron &&
+        rm -rf /var/lib/apt/lists/* &&
+        exec docker-entrypoint.sh postgres \
+          -c shared_preload_libraries=pg_cron,pg_stat_statements \
+          -c cron.database_name=ollama_memoryDB
+    networks:
+      - dockge_default
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8080:8080
+    networks:
+      - dockge_default
+
+  postgres-mcp:
+    image: crystaldba/postgres-mcp:latest
+    container_name: postgres-mcp
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - 7779:8000
+    environment:
+      DATABASE_URI: postgresql://${POSTGRES_USER:-ollama_cpp_mcp}:${POSTGRES_PASSWORD:?set in .env}@db:5432/ollama_memoryDB
+    volumes:
+      - ./server.py:/app/src/postgres_mcp/server.py:ro
+    command:
+      - --access-mode=unrestricted
+      - --transport=sse
+      - --sse-host=0.0.0.0
+      - --sse-port=8000
+    networks:
+      - dockge_default
+
+  memorydb-openapi:
+    image: ghcr.io/open-webui/mcpo:main
+    container_name: memorydb-openapi
+    restart: unless-stopped
+    depends_on:
+      - postgres-mcp
+    ports:
+      - 7781:8000
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --server-type
+      - sse
+      - --
+      - http://postgres-mcp:8000/sse
+    networks:
+      - dockge_default
+
+  memorydb-plugin:
+    image: local/zorg-memorydb-plugin:1
+    pull_policy: never
+    container_name: memorydb-plugin
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - db
+    ports:
+      - "7782:8000"
+    environment:
+      DATABASE_URI: postgresql://${POSTGRES_USER:-ollama_cpp_mcp}:${POSTGRES_PASSWORD:?set in .env}@db:5432/ollama_memoryDB
+      POSTGRES_NATIVE_TOKEN: ${POSTGRES_NATIVE_TOKEN:?set in .env}
+    volumes:
+      - ./server.py:/app/src/postgres_mcp/server.py:ro
+      - ./memorydb-plugin.py:/app/memorydb-plugin.py:ro
+    entrypoint:
+      - /app/.venv/bin/python
+      - /app/memorydb-plugin.py
+    command:
+      - --access-mode=unrestricted
+      - --host=0.0.0.0
+      - --port=8000
+    networks:
+      - dockge_default
+
+networks:
+  dockge_default:
+    external: true
