@@ -1,0 +1,504 @@
+# ruff: noqa: B008
+import argparse
+import asyncio
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import urllib.error
+import urllib.request
+from enum import Enum
+from typing import Any
+from typing import List
+from typing import Literal
+from typing import Union
+
+import mcp.types as types
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from pydantic import validate_call
+from starlette.requests import Request
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+import uvicorn
+
+from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
+
+from .artifacts import ErrorResult
+from .artifacts import ExplainPlanArtifact
+from .database_health import DatabaseHealthTool
+from .database_health import HealthType
+from .explain import ExplainPlanTool
+from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
+from .index.llm_opt import LLMOptimizerTool
+from .index.presentation import TextPresentation
+from .sql import DbConnPool
+from .sql import SafeSqlDriver
+from .sql import SqlDriver
+from .sql import check_hypopg_installation_status
+from .sql import obfuscate_password
+from .top_queries import TopQueriesCalc
+
+# Initialize FastMCP with default settings
+mcp = FastMCP("postgres-mcp")
+
+# Constants
+PG_STAT_STATEMENTS = "pg_stat_statements"
+HYPOPG_EXTENSION = "hypopg"
+
+ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
+
+logger = logging.getLogger(__name__)
+
+
+MAX_MEMORYDB_CHAT_BLOCKS = 30
+DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+DEFAULT_CONTEXT_COMPACTION_URL = os.environ.get("COMPACTION_ENDPOINT", "http://localhost:11434/api/chat")
+DEFAULT_CONTEXT_COMPACTION_MODEL = os.environ.get("COMPACTION_MODEL", "minicpm-v4.6:latest")
+def _compaction_targets_from_env():
+    base = DEFAULT_CONTEXT_COMPACTION_URL
+    model = DEFAULT_CONTEXT_COMPACTION_MODEL
+    extra = os.environ.get("COMPACTION_TARGETS", "")  # comma-separated "url,model" pairs
+    targets = [(base, model)]
+    for part in extra.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "," in part:
+            u, m = part.split(",", 1)
+            targets.append((u.strip(), m.strip()))
+        else:
+            targets.append((part, model))
+    return targets
+
+DEFAULT_CONTEXT_COMPACTION_TARGETS = _compaction_targets_from_env()
+DEFAULT_MEMORYDB_SESSION_KEY = "agent:main:lan-chat"
+MEMORYDB_SYSTEM_TOOL_INSTRUCTIONS = """
+MemoryDB MCP contract:
+- Treat PostgreSQL/MemoryDB as the sole source of memory recall and chat history.
+- Use memorydb_query_memory for follow-up memory questions during a turn.
+- Use memorydb_get_chat_history_blocks for bounded recent chat blocks; never request more than 30 blocks.
+
+Context Management (self-configuration):
+- The zorg memoryDB is the context source (brain, not flat text). After receiving a message, the FIRST action is an in-context search (zorg_weighted_recall_context + zorg_core_rule_preflight_v1). What is returned should be ALL that is needed to respond in that turn.
+- Stale/out-of-context data from unrelated requests is NOT included. The slot is erased before each turn to ensure clean context.
+- Compaction targets are self-configurable via memorydb_compaction_config tool:
+  * action=list to see current targets
+  * action=add to register a new endpoint (if a model goes down, add a backup)
+  * action=remove to disable a dead target
+  * action=health to probe all targets and update health status
+  * Targets are tried in priority order; failed ones are skipped automatically
+- Slot management via MCP tools:
+  * memorydb_slot_state to check utilization
+  * memorydb_slot_erase to clear stale context
+  * memorydb_slot_save / memorydb_slot_restore to persist/restore context
+- Context items tracking:
+  * memorydb_context_items to view what's in the context
+  * memorydb_context_add_item to track what was loaded
+  * memorydb_context_remove_item to surgically remove items by type
+- If the compaction model is down, check memorydb_compaction_config action=health and add a fallback endpoint.
+- The context_window and num_ctx values come from context_compaction_config (not hardcoded).
+- Stream exposed model output back through memorydb_stream_model_output when the client can do so.
+- Commit final assistant output through memorydb_commit_turn.
+- Only capture model fields exposed by the connected model/server. Do not invent hidden reasoning.
+""".strip()
+
+
+def _json_default(value: Any) -> str:
+    return str(value)
+
+
+def _to_json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
+def _jsonable(value: Any) -> Any:
+    return json.loads(_to_json_text(value))
+
+
+def _rows(rows: Any) -> list[dict[str, Any]]:
+    return [row.cells for row in rows] if rows else []
+
+
+def _clamp_limit(value: int, minimum: int = 1, maximum: int = 50) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = minimum
+    return max(minimum, min(maximum, parsed))
+
+
+def _metadata(base: dict[str, Any] | None, **extra: Any) -> str:
+    data = dict(base or {})
+    data.update({key: value for key, value in extra.items() if value is not None})
+    return _to_json_text(data)
+
+
+def _token_estimate(text: str) -> int:
+    return max(1, math.ceil(len(text or "") / 4))
+
+
+# ============================================================
+# LLM Endpoint Scanner - Dynamic Context Window Detection
+# ============================================================
+
+def _http_get_json(url: str, auth_token: str | None = None, timeout: int = 10) -> dict | None:
+    req = urllib.request.Request(url)
+    if auth_token:
+        req.add_header('Authorization', f'Bearer {auth_token}')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def _http_get_text(url: str, auth_token: str | None = None, timeout: int = 10) -> str | None:
+    req = urllib.request.Request(url)
+    if auth_token:
+        req.add_header('Authorization', f'Bearer {auth_token}')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        return None
+
+
+async def scan_llm_endpoint(endpoint: str, auth_token: str | None = None) -> dict:
+    'Scan an LLM endpoint to detect serving system, context window, and API format.'
+    endpoint = endpoint.rstrip('/')
+    result = {
+        'endpoint': endpoint, 'serving_system': 'unknown', 'api_format': 'unknown',
+        'context_window': 4096, 'max_output_tokens': 4096,
+        'supports_per_request_ctx': False, 'model_name': None, 'found': False,
+    }
+    probe_data = {}
+
+    # Strategy 1: Ollama /api/tags
+    resp = await asyncio.to_thread(_http_get_json, endpoint + '/api/tags', auth_token)
+    if resp and 'models' in resp and isinstance(resp['models'], list) and resp['models']:
+        details = resp['models'][0].get('details', {})
+        result['serving_system'] = 'ollama'
+        result['api_format'] = 'ollama_api'
+        result['supports_per_request_ctx'] = True
+        if 'context_length' in details:
+            result['context_window'] = int(details.get('context_length', 4096))
+        result['model_name'] = resp['models'][0].get('name')
+        result['found'] = True
+        probe_data = {'source': 'ollama_api_tags', 'model_count': len(resp['models'])}
+
+    # Strategy 2: OpenAI-compatible /v1/models (llama.cpp, vLLM, LM Studio)
+    if not result['found']:
+        resp = await asyncio.to_thread(_http_get_json, endpoint + '/v1/models', auth_token)
+        if resp and 'data' in resp and isinstance(resp['data'], list):
+            result['serving_system'] = 'openai_compatible'
+            result['api_format'] = 'openai_compatible'
+            result['context_window'] = 131072
+            result['found'] = True
+            if resp['data']:
+                result['model_name'] = resp['data'][0].get('id')
+            model_id = result['model_name'] or ''
+            if 'gguf' in model_id or '/' in model_id:
+                result['serving_system'] = 'llama_cpp'
+            probe_data = {'source': 'openai_v1_models', 'model_count': len(resp['data'])}
+
+    # Strategy 3: Ollama /api/version fallback
+    if not result['found']:
+        resp = await asyncio.to_thread(_http_get_json, endpoint + '/api/version', auth_token)
+        if resp and 'version' in resp:
+            result['serving_system'] = 'ollama'
+            result['api_format'] = 'ollama_api'
+            result['supports_per_request_ctx'] = True
+            result['found'] = True
+            probe_data = {'source': 'ollama_api_version', 'version': resp.get('version')}
+
+    # Strategy 4: Generic health check
+    if not result['found']:
+        resp = await asyncio.to_thread(_http_get_text, endpoint + '/health', auth_token)
+        if resp is not None:
+            result['found'] = True
+            probe_data = {'source': 'health', 'response': resp[:100]}
+
+    probe_data.update({
+        'system': result['serving_system'],
+        'api_format': result['api_format'],
+        'context_window': result['context_window'],
+        'model': result['model_name'],
+    })
+
+    # Upsert into llm_registry
+    try:
+        sql_driver = await get_sql_driver()
+        await sql_driver.execute_query(
+            'INSERT INTO public.llm_registry '
+            '(serving_system, endpoint, model_name, context_window,'
+            'max_output_tokens, supports_per_request_ctx, api_format,'
+            'auth_token, is_active, probe_data, last_probed_at) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, true, %s, now()) '
+            'ON CONFLICT (endpoint) DO UPDATE SET '
+            'serving_system = EXCLUDED.serving_system, model_name = EXCLUDED.model_name,'
+            'context_window = EXCLUDED.context_window, max_output_tokens = EXCLUDED.max_output_tokens,'
+            'supports_per_request_ctx = EXCLUDED.supports_per_request_ctx,'
+            'api_format = EXCLUDED.api_format, auth_token = EXCLUDED.auth_token,'
+            'probe_data = EXCLUDED.probe_data, last_probed_at = now(), updated_at = now()',
+            [result['serving_system'], endpoint, result['model_name'],
+             result['context_window'], result['max_output_tokens'],
+             result['supports_per_request_ctx'], result['api_format'],
+             auth_token, _to_json_text(probe_data)],
+        )
+    except Exception as e:
+        result['registry_error'] = str(e)
+
+    return result
+
+
+async def get_llm_context_from_registry(endpoint: str) -> dict | None:
+    'Look up an endpoint in llm_registry for context window info.'
+    endpoint = endpoint.rstrip('/')
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            'SELECT serving_system, endpoint, model_name, context_window,'
+            'max_output_tokens, supports_per_request_ctx, api_format, is_active, probe_data, last_probed_at'
+            'FROM public.llm_registry WHERE endpoint = %s AND is_active = true',
+            [endpoint],
+        )
+        data = _rows(rows)
+        return data[0] if data else None
+    except Exception:
+        return None
+
+
+async def get_default_llm_context() -> dict:
+    'Get default LLM context from registry or hardcoded fallback.'
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            'SELECT serving_system, endpoint, model_name, context_window,'
+            'max_output_tokens, supports_per_request_ctx, api_format'
+            'FROM public.llm_registry WHERE is_active = true'
+            'ORDER BY last_probed_at DESC NULLS LAST LIMIT 1'
+        )
+        data = _rows(rows)
+        if data:
+            return data[0]
+    except Exception:
+        pass
+    return {
+        'serving_system': 'llama_cpp',
+        'endpoint': os.environ.get('POSTGRES_MCP_SLOT_ENDPOINT', 'http://localhost:9001'),
+        'context_window': DEFAULT_CONTEXT_WINDOW_TOKENS,
+        'supports_per_request_ctx': False,
+        'api_format': 'openai_compatible',
+    }
+
+
+DEFAULT_LLM_ENDPOINTS = [
+    (os.environ.get("POSTGRES_MCP_SLOT_ENDPOINT", "http://localhost:9001"), None),
+    (DEFAULT_CONTEXT_COMPACTION_URL, None),
+]
+
+class AccessMode(str, Enum):
+    """SQL access modes for the server."""
+
+    UNRESTRICTED = "unrestricted"  # Unrestricted access
+    RESTRICTED = "restricted"  # Read-only with safety features
+
+
+# Global variables
+db_connection = DbConnPool()
+current_access_mode = AccessMode.UNRESTRICTED
+shutdown_in_progress = False
+
+
+async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
+    """Get the appropriate SQL driver based on the current access mode."""
+    base_driver = SqlDriver(conn=db_connection)
+
+    if current_access_mode == AccessMode.RESTRICTED:
+        logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
+        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+    else:
+        logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
+        return base_driver
+
+
+def format_text_response(text: Any) -> ResponseType:
+    """Format a text response."""
+    return [types.TextContent(type="text", text=str(text))]
+
+
+def format_error_response(error: str) -> ResponseType:
+    """Format an error response."""
+    return format_text_response(f"Error: {error}")
+
+
+@mcp.tool(description="List all schemas in the database")
+async def list_schemas() -> ResponseType:
+    """List all schemas in the database."""
+    try:
+        sql_driver = await get_sql_driver()
+        rows = await sql_driver.execute_query(
+            """
+            SELECT
+                schema_name,
+                schema_owner,
+                CASE
+                    WHEN schema_name LIKE 'pg_%' THEN 'System Schema'
+                    WHEN schema_name = 'information_schema' THEN 'System Information Schema'
+                    ELSE 'User Schema'
+                END as schema_type
+            FROM information_schema.schemata
+            ORDER BY schema_type, schema_name
+            """
+        )
+        schemas = [row.cells for row in rows] if rows else []
+        return format_text_response(schemas)
+    except Exception as e:
+        logger.error(f"Error listing schemas: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="List objects in a schema")
+async def list_objects(
+    schema_name: str = Field(description="Schema name"),
+    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+) -> ResponseType:
+    """List objects of a given type in a schema."""
+    try:
+        sql_driver = await get_sql_driver()
+
+        if object_type in ("table", "view"):
+            table_type = "BASE TABLE" if object_type == "table" else "VIEW"
+            rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT table_schema, table_name, table_type
+                FROM information_schema.tables
+                WHERE table_schema = {} AND table_type = {}
+                ORDER BY table_name
+                """,
+                [schema_name, table_type],
+            )
+            objects = (
+                [{"schema": row.cells["table_schema"], "name": row.cells["table_name"], "type": row.cells["table_type"]} for row in rows]
+                if rows
+                else []
+            )
+
+        elif object_type == "sequence":
+            rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT sequence_schema, sequence_name, data_type
+                FROM information_schema.sequences
+                WHERE sequence_schema = {}
+                ORDER BY sequence_name
+                """,
+                [schema_name],
+            )
+            objects = (
+                [{"schema": row.cells["sequence_schema"], "name": row.cells["sequence_name"], "data_type": row.cells["data_type"]} for row in rows]
+                if rows
+                else []
+            )
+
+        elif object_type == "extension":
+            # Extensions are not schema-specific
+            rows = await sql_driver.execute_query(
+                """
+                SELECT extname, extversion, extrelocatable
+                FROM pg_extension
+                ORDER BY extname
+                """
+            )
+            objects = (
+                [{"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]} for row in rows]
+                if rows
+                else []
+            )
+
+        else:
+            return format_error_response(f"Unsupported object type: {object_type}")
+
+        return format_text_response(objects)
+    except Exception as e:
+        logger.error(f"Error listing objects: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Show detailed information about a database object")
+async def get_object_details(
+    schema_name: str = Field(description="Schema name"),
+    object_name: str = Field(description="Object name"),
+    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+) -> ResponseType:
+    """Get detailed information about a database object."""
+    try:
+        sql_driver = await get_sql_driver()
+
+        if object_type in ("table", "view"):
+            # Get columns
+            col_rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = {} AND table_name = {}
+                ORDER BY ordinal_position
+                """,
+                [schema_name, object_name],
+            )
+            columns = (
+                [
+                    {
+                        "column": r.cells["column_name"],
+                        "data_type": r.cells["data_type"],
+                        "is_nullable": r.cells["is_nullable"],
+                        "default": r.cells["column_default"],
+                    }
+                    for r in col_rows
+                ]
+                if col_rows
+                else []
+            )
+
+            # Get constraints
+            con_rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
+                FROM information_schema.table_constraints AS tc
+                LEFT JOIN information_schema.key_column_usage AS kcu
+                  ON tc.constraint_name = kcu.column_name
+                 AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema = {} AND tc.table_name = {}
+                """,
+                [schema_name, object_name],
+            )
+
+            constraints = {}
+            if con_rows:
+                for row in con_rows:
+                    cname = row.cells["constraint_name"]
+                    ctype = row.cells["constraint_type"]
+                    col = row.cells["column_name"]
+
+                    if cname not in constraints:
+                        constraints[cname] = {"type": ctype, "columns": []}
+                    if col:
+                        constraints[cname]["columns"].append(col)
+
+            constraints_list = [{"name": name, **data} for name, data in constraints.items()]
+
+            # Get indexes
+            idx_rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT indexname, indexdef
