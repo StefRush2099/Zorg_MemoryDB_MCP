@@ -369,3 +369,4 @@ CREATE TABLE IF NOT EXISTS md_recovery_log (
     committed_assistant_msg_id uuid,
     details jsonb NOT NULL DEFAULT '{}'::jsonb
 );
+
