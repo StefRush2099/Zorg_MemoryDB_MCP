@@ -24,5 +24,17 @@ jobs:
           TWINE_USERNAME=__token__ \
           TWINE_PASSWORD=${{ secrets.GITHUB_TOKEN }} \
           twine upload --repository-url https://upload.pypi.org/legacy/ dist/*
-          echo "Package published to GitHub Packages registry."
-          echo "Install: pip install --index-url https://python.pkg.github.com/STEFKUSHRUSH2099/zorg-memorydb-mcp zorg-memorydb-mcp"
+        env:
+          TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
+      - name: Publish to GitHub Packages (correct URL)
+        run: |
+          pip install twine
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=${{ secrets.GITHUB_TOKEN }} \
+          twine upload --repository-url https://python.pkg.github.com/StefRush2099 dist/*
+        continue-on-error: true
+      - name: Show install instructions
+        run: |
+          echo "=== Install from GitHub Packages ==="
+          echo "Configure .pypirc or use: pip install --index-url https://python.pkg.github.com/StefRush2099 zorg-memorydb-mcp"
+          echo "GitHub token required for auth."
