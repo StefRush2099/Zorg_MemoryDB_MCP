@@ -1,25 +1,42 @@
-name: Create Release
+name: Create Release v1.0.0
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/create-release.yml'
   workflow_dispatch:
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Create tag and release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api repos/${{ github.repository }}/git/tags \
+          if gh api repos/${{ github.repository }}/git/refs/tags/v1.0.0 2>/dev/null; then
+            echo "Tag v1.0.0 already exists, skipping."
+            exit 0
+          fi
+          TAG_SHA=$(gh api repos/${{ github.repository }}/git/tags \
             -f tag=v1.0.0 \
             -f tagger.name=StefRush2099 \
             -f tagger.email=stefrush2099@gmail.com \
             -f tagger.date="2026-10-04T14:30:00Z" \
             -f message="Zorg MemoryDB MCP v1.0.0" \
-            -f object=67e666c7646e986f77c2ab56209ee9ef98b2d457 \
-            -f type=commit
+            -f object=${GITHUB_SHA} \
+            -f type=commit --jq .sha)
           gh api repos/${{ github.repository }}/git/refs \
             -f ref=refs/tags/v1.0.0 \
-            -f sha=$(gh api repos/${{ github.repository }}/git/refs/tags/v1.0.0 --jq .object.sha 2>/dev/null || echo "")
+            -f sha=${TAG_SHA}
           gh release create v1.0.0 \
             --title "Zorg MemoryDB MCP v1.0.0" \
-            --notes "First public release. PostgreSQL-backed durable memory + operating-rule system for LLM assistants."
+            --notes "First public release. PostgreSQL-backed durable memory + operating-rule system for LLM assistants. See CHANGELOG.md for details." \
+            --target ${GITHUB_SHA}
+          echo "Release v1.0.0 created successfully."
