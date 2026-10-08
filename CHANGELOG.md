@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.0.1 (2026-10-08)
+
+Memory system publish update.
+
+### Changes
+
+- Bumped version to v1.0.1
+- Captured the MemoryDB work-block / work-table methodology live in memory:
+  - New reusable block `block:publish-memorydb-to-github` (7 steps) in `memory_cognitive_procedures`
+  - New work table `project:publish-memorydb-to-github-2026-10-08` (8 steps)
+  - Refreshed ANN index so the block auto-suggests on similar future requests
+- Documented the proven GitHub publish access path: GitHub Actions workflow using the built-in `GITHUB_TOKEN` (no external token required)
+
 ## v1.0.0 (2026-10-04)
 
 First public release of the Zorg MemoryDB MCP stack.
